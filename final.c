@@ -1,7 +1,13 @@
+#define _GNU_SOURCE
+#include <sched.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <pthread.h>
-#include <sched.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <errno.h>
 
 typedef unsigned long long uint64_t;
 
@@ -32,6 +38,8 @@ typedef unsigned long long uint64_t;
 */
 bool measurement_overhead_initialized = false;
 uint64_t measurement_overhead;
+bool cpu_cycles_per_sec_inited = false;
+uint64_t cpu_cycles_per_sec;
 
 #define CPU_FREQ_ITERATIONS	10
 void measure_CPU_frequency()
@@ -49,13 +57,16 @@ void measure_CPU_frequency()
 		STOP();
 	
 		sum += ELAPSED_CYCLES();
-		printf("%i: Elapsed cycles = %llu\n", i+1, ELAPSED_CYCLES());
+//		printf("%i: Elapsed cycles = %llu\n", i+1, ELAPSED_CYCLES());
+		printf(".\n");
 	}
 
-	printf("CPU frequency: %llu per sec or %llu GHz\n", sum, sum/10000000000L);
+	cpu_cycles_per_sec = sum/10;
+	cpu_cycles_per_sec_inited = true;
+	printf("CPU frequency: %llu cycles per sec or %lf GHz\n", cpu_cycles_per_sec, (double)sum/(double)10000000000L);
 }
 
-#define OVERHEAD_MEASUREMENT_ITERS	10
+#define OVERHEAD_MEASUREMENT_ITERS	100
 void calculate_measurement_overhead()
 {
 	DECLARE_COUNTERS
@@ -73,6 +84,8 @@ void calculate_measurement_overhead()
 		printf("%i: Elapsed cycles = %llu\n", i+1, ELAPSED_CYCLES());
 	}
 
+	measurement_overhead = sum/OVERHEAD_MEASUREMENT_ITERS;
+	measurement_overhead_initialized = true;
 	printf("Measurement overhead is %llu cycles\n", sum/OVERHEAD_MEASUREMENT_ITERS);
 }
 
@@ -193,11 +206,11 @@ void calculate_proccall_overhead()
    we spawn multiple processes to make the system call separately
    and measure the time
 */
-#define SYSCALL_MEASUREMENT_ITERS	10
+#define SYSCALL_MEASUREMENT_ITERS	100
 void calculate_syscall_overhead()
 {
 	DECLARE_COUNTERS;
-	int i = 0;
+	int i = 0, status;
 	uint64_t sum = 0;
 
 	printf("Computing syscall overhead...\n");
@@ -219,23 +232,26 @@ void calculate_syscall_overhead()
 			STOP();
 
 			fprintf(fp, "%llu\n", ELAPSED_CYCLES());
-			printf("Elapsed cycles: %llu\n", ELAPSED_CYCLES());
+			printf("SYSCALL: Elapsed cycles: %llu\n", ELAPSED_CYCLES());
+			return;
 		}
 		else 	// Parent
 		{
-			wait();
+			wait(&status);
 		}
 	}
 
-	printf("Overhead of making a system call is %llu cycles\n", sum/SYSCALL_MEASUREMENT_ITERS);
+//	printf("Overhead of making a system call is %llu cycles\n", sum/SYSCALL_MEASUREMENT_ITERS);
 }
 
 #define PC_OVERHEAD_ITERS 10
 void calculate_process_creation_overhead()
 {
 	DECLARE_COUNTERS;
-	int i = 0;
+	int i = 0, status;
 	uint64_t sum = 0;
+
+	printf("Starting process creation measurements...\n");
 
 	FILE *fp = fopen("process_creation_data.txt", "w");
 
@@ -258,13 +274,14 @@ void calculate_process_creation_overhead()
 		else 	// If parent, stop counter first, then wait for child
 		{
 			STOP();
-			wait();
+			wait(NULL);
 			fprintf(fp, "%llu\n", ELAPSED_CYCLES());
+//			printf("Process creation: %llu\n", ELAPSED_CYCLES());
 		}
 	}
 }
 
-void * thread_func(void *)
+void * thread_func(void *arg)
 {
 	return 0;
 }
@@ -290,7 +307,7 @@ void calculate_thread_creation_overhead()
 		if (0 == pthread_create(&thread, NULL, thread_func, NULL))
 		{
 			STOP();
-			if (pthread_join(thread_func, NULL))
+			if (pthread_join(thread, NULL))
 			{
 				printf("Error joining thread...\n");
 			}
@@ -308,15 +325,15 @@ void calculate_context_switch_time()
 	struct sched_param prio_params;
 	int max_prio;
 	uint64_t starttime, timevar, endtime;
-	int pipe[2];
+	int pipe1[2], pipe2[2];
 	pid_t pid;
 
-	CPU_ZERO(affinity);
+	CPU_ZERO(&affinity);
 	CPU_SET(0, &affinity);
 
-	if (sched_setaffinity(get_pid(), sizeof(cpu_set_t), &affinity))
+	if (sched_setaffinity(getpid(), sizeof(cpu_set_t), &affinity))
 	{
-		printf("Setting CPU affinity for process %d failed\n", get_pid());
+		printf("Setting CPU affinity for process %d failed\n", getpid());
 	}
 
 	if ((max_prio = sched_get_priority_max(SCHED_FIFO)) < 0)
@@ -325,12 +342,23 @@ void calculate_context_switch_time()
 	}
 
 	prio_params.sched_priority = max_prio;
-	if (sched_setscheduler(getpid(), SCHED_FIFO, &prio_params))
+	int ret = sched_setscheduler(getpid(), SCHED_FIFO, &prio_params);
+//	if (sched_setscheduler(getpid(), SCHED_FIFO, &prio_params))
+	if (ret == EPERM)
 	{
-		printf("Setting policy/priority for process failed\n");
+		printf("Setting policy/priority for process failed: EPERM\n");
+	}
+	else if (ret == EINVAL)
+		printf("EINVAL\n");
+	else
+		printf("PID: %d ESRCH\n", getpid());
+
+	if (pipe(pipe1) == -1)
+	{
+		printf("Pipe creation failed...\n");
 	}
 
-	if (pipe(pipe) == -1)
+	if (pipe(pipe2) == -1)
 	{
 		printf("Pipe creation failed...\n");
 	}
@@ -338,32 +366,31 @@ void calculate_context_switch_time()
 	pid = fork();
 	if (pid == 0)	// Child
 	{
-		if (read(pipe[0], (char*)&timevar, sizeof(timevar)) == -1)
+		if (read(pipe1[0], (char*)&timevar, sizeof(timevar)) == -1)
 		{
-
+			printf("CHILD: read error!\n");
 		}
 
 		STOP();
 
 		uint64_t elapsed = ( ((uint64_t)cycles_high1 << 32) | cycles_low1 ) - timevar;
 
-		if (write(pipe[1], (char*)&elapsed, sizeof(elapsed)) == -1)
+		if (write(pipe2[1], (char*)&elapsed, sizeof(elapsed)) == -1)
 		{
-
+			printf("CHILD: write error!\n");
 		}
 	}
 	else 	// Parent
 	{
 		START();
 		starttime = ( ((uint64_t)cycles_high << 32) | cycles_low );
-		if (write(pipe[1], &starttime, sizeof(starttime)) == -1)
+		if (write(pipe1[1], &starttime, sizeof(starttime)) == -1)
 		{
-
+			printf("PARENT: Write error!\n");
 		}
-
-		if (read(pipe[0], &timevar, sizeof(timevar)) == -1)
+		if (read(pipe2[0], &timevar, sizeof(timevar)) == -1)
 		{
-
+			printf("PARENT: Read error!\n");
 		}
 
 		printf("TIMEVAR: %llu\n", timevar);
@@ -373,7 +400,7 @@ void calculate_context_switch_time()
 int main(int argc, int* argv)
 {
 	/* PHASE 1: Calculate the base frequency of the processor */
-	measure_CPU_frequency();
+//	measure_CPU_frequency();
 
 	/* PHASE 2: Estimate the measurement overhead */
 	calculate_measurement_overhead();
@@ -382,18 +409,19 @@ int main(int argc, int* argv)
 	calculate_proccall_overhead();
 
 	/* PHASE 4: Estimate the overhead of making a system call */
-	calculate_syscall_overhead();
+//	calculate_syscall_overhead();
 
 	/* PHASE 5: Compute time to create a process */
-	calculate_process_creation_overhead();
+//	calculate_process_creation_overhead();
 
 	/* PHASE 6: Calculate thread creation overhead */
-	calculate_thread_creation_overhead();
+//	calculate_thread_creation_overhead();
 
 	/* PHASE 7: Calculate context swicth time */
-	calculate_context_switch_time();
+//	calculate_context_switch_time();
 
 
 
 	return 0;
 }
+
