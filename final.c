@@ -1,5 +1,7 @@
 #include <unistd.h>
 #include <stdlib.h>
+#include <pthread.h>
+#include <sched.h>
 
 typedef unsigned long long uint64_t;
 
@@ -49,7 +51,7 @@ void measure_CPU_frequency()
 		sum += ELAPSED_CYCLES();
 		printf("%i: Elapsed cycles = %llu\n", i+1, ELAPSED_CYCLES());
 	}
-	
+
 	printf("CPU frequency: %llu per sec or %llu GHz\n", sum, sum/10000000000L);
 }
 
@@ -140,40 +142,49 @@ void calculate_proccall_overhead()
 		printf("%s WARNING: Failed to open file\n", __FUNCTION__);
 	}
 
+	fprintf(fp, "ARG0 ARG1 ARG2 ARG3 ARG4 ARG5 ARG6 ARG7\n");
+
 	for (i = 0; i < PROCCALL_MEASUREMENT_ITERS; i++)
 	{
 		START();
 		func();
 		STOP();
-		fprintf();
+		fprintf(fp, "%llu ", ELAPSED_CYCLES() - measurement_overhead);
 
 		START();
 		func1(i);
 		STOP();
+		fprintf(fp, "%llu ", ELAPSED_CYCLES() - measurement_overhead);
 
 		START();
 		func2(i, i+1);
 		STOP();
+		fprintf(fp, "%llu ", ELAPSED_CYCLES() - measurement_overhead);
 
 		START();
 		func3(i, i+1, i+2);
 		STOP();
+		fprintf(fp, "%llu ", ELAPSED_CYCLES() - measurement_overhead);
 
 		START();
 		func4(i, i+1, i+2, i+3);
 		STOP();
+		fprintf(fp, "%llu ", ELAPSED_CYCLES() - measurement_overhead);
 
 		START();
 		func5(i, i+1, i+2, i+3, i+4);
 		STOP();
+		fprintf(fp, "%llu ", ELAPSED_CYCLES() - measurement_overhead);
 
 		START();
 		func6(i, i+1, i+2, i+3, i+4, i+5);
 		STOP();
+		fprintf(fp, "%llu ", ELAPSED_CYCLES() - measurement_overhead);
 
 		START();
 		func7(i, i+1, i+2, i+3, i+4, i+5, i+6);
 		STOP();
+		fprintf(fp, "%llu\n", ELAPSED_CYCLES() - measurement_overhead);
 	}
 
 }
@@ -253,16 +264,110 @@ void calculate_process_creation_overhead()
 	}
 }
 
+void * thread_func(void *)
+{
+	return 0;
+}
+
 #define TC_OVERHEAD_ITERS 10
 void calculate_thread_creation_overhead()
 {
+	DECLARE_COUNTERS;
+	int i = 0;
+	uint64_t sum = 0;
+	pthread_t thread;
 
+	FILE *fp = fopen("thread_overhead_data.txt", "w");
+
+	if (fp == NULL)
+	{
+		printf("%s WARNING: Failed to open file. Bailing...\n", __FUNCTION__);
+	}
+
+	for (i = 0; i < TC_OVERHEAD_ITERS; i++)
+	{
+		START();
+		if (0 == pthread_create(&thread, NULL, thread_func, NULL))
+		{
+			STOP();
+			if (pthread_join(thread_func, NULL))
+			{
+				printf("Error joining thread...\n");
+			}
+
+			fprintf(fp, "%llu\n", ELAPSED_CYCLES());
+		}
+	}
 }
 
 #define CONTEXT_SWITCH_MEASUREMENT_ITERS 10
 void calculate_context_switch_time()
 {
+	DECLARE_COUNTERS;
+	cpu_set_t affinity;
+	struct sched_param prio_params;
+	int max_prio;
+	uint64_t starttime, timevar, endtime;
+	int pipe[2];
+	pid_t pid;
 
+	CPU_ZERO(affinity);
+	CPU_SET(0, &affinity);
+
+	if (sched_setaffinity(get_pid(), sizeof(cpu_set_t), &affinity))
+	{
+		printf("Setting CPU affinity for process %d failed\n", get_pid());
+	}
+
+	if ((max_prio = sched_get_priority_max(SCHED_FIFO)) < 0)
+	{
+		printf("Get max priority for process failed\n");
+	}
+
+	prio_params.sched_priority = max_prio;
+	if (sched_setscheduler(getpid(), SCHED_FIFO, &prio_params))
+	{
+		printf("Setting policy/priority for process failed\n");
+	}
+
+	if (pipe(pipe) == -1)
+	{
+		printf("Pipe creation failed...\n");
+	}
+
+	pid = fork();
+	if (pid == 0)	// Child
+	{
+		if (read(pipe[0], (char*)&timevar, sizeof(timevar)) == -1)
+		{
+
+		}
+
+		STOP();
+
+		uint64_t elapsed = ( ((uint64_t)cycles_high1 << 32) | cycles_low1 ) - timevar;
+
+		if (write(pipe[1], (char*)&elapsed, sizeof(elapsed)) == -1)
+		{
+
+		}
+	}
+	else 	// Parent
+	{
+		START();
+		starttime = ( ((uint64_t)cycles_high << 32) | cycles_low );
+		if (write(pipe[1], &starttime, sizeof(starttime)) == -1)
+		{
+
+		}
+
+		if (read(pipe[0], &timevar, sizeof(timevar)) == -1)
+		{
+
+		}
+
+		printf("TIMEVAR: %llu\n", timevar);
+	}
 }
 
 int main(int argc, int* argv)
@@ -287,6 +392,8 @@ int main(int argc, int* argv)
 
 	/* PHASE 7: Calculate context swicth time */
 	calculate_context_switch_time();
+
+
 
 	return 0;
 }
